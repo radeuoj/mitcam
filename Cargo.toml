@@ -1,0 +1,10 @@
+[package]
+name = "mitcam"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+image = "0.25.9"
+nokhwa = { version = "0.10.10", features = ["input-native"] }
+softbuffer = "0.4.8"
+winit = "0.30.12"
