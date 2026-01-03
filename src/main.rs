@@ -2,7 +2,7 @@ use axum::body::Bytes;
 use axum::extract::ws::{Message, WebSocket};
 use axum::extract::{ConnectInfo, WebSocketUpgrade};
 use axum::routing::any;
-use axum::{Router, ServiceExt};
+use axum::Router;
 use axum_extra::TypedHeader;
 use futures_util::{SinkExt, StreamExt};
 use nokhwa::pixel_format::RgbAFormat;
@@ -12,9 +12,11 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::num::NonZeroU32;
 use std::process::exit;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::Arc;
+use std::sync::RwLock;
 use std::time::Duration;
 use tokio::net::TcpListener;
+use tokio::sync::Mutex;
 use tower_http::services::ServeDir;
 use tower_http::trace::{DefaultMakeSpan, TraceLayer};
 use winit::application::ApplicationHandler;
@@ -23,9 +25,10 @@ use winit::event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy, OwnedDisplay
 use winit::window::{Window, WindowId};
 
 const CAMERA_INDEX: u32 = 1;
+const TARGET_SIZE: (u32, u32) = (256, 144);
 const SLEEP_TIME: Duration = Duration::from_millis(100);
 type Decoder = RgbAFormat;
-type Tx = std::sync::mpsc::Sender<Bytes>;
+type Tx = tokio::sync::mpsc::Sender<Bytes>;
 type PeerMap = Arc<Mutex<HashMap<SocketAddr, Tx>>>;
 
 struct App<'a> {
@@ -113,15 +116,37 @@ fn make_buffer(size: (u32, u32)) -> Vec<u8> {
     buffer
 }
 
+fn scale_buffer(src: &[u8], src_size: (u32, u32), dst: &mut [u8], dst_size: (u32, u32)) {
+    let src_size = (src_size.0 as usize, src_size.1 as usize);
+    let dst_size = (dst_size.0 as usize, dst_size.1 as usize);
+
+    for j in 0..dst_size.1 {
+        let src_y = j * src_size.1 / dst_size.1;
+        for i in 0..dst_size.0 {
+            let src_x = i * src_size.0 / dst_size.0;
+            let src_idx = (src_y * src_size.0 + src_x) * 4;
+            let dst_idx = (j * dst_size.0 + i) * 4;
+            dst[dst_idx] = src[src_idx];
+            dst[dst_idx + 1] = src[src_idx + 1];
+            dst[dst_idx + 2] = src[src_idx + 2];
+            dst[dst_idx + 3] = src[src_idx + 3];
+        }
+    }
+}
+
 fn run_camera(front_buffer: &RwLock<Vec<u8>>) {
     let mut camera = make_camera();
     camera.open_stream().unwrap();
-    let mut back_buffer = make_buffer(get_camera_resolution(&camera));
+    let camera_size = get_camera_resolution(&camera);
+    let mut out_buffer = make_buffer(camera_size);
+    let mut back_buffer = make_buffer(TARGET_SIZE);
 
     loop {
-        camera.write_frame_to_buffer::<Decoder>(&mut back_buffer).unwrap();
+        camera.write_frame_to_buffer::<Decoder>(&mut out_buffer).unwrap();
+        scale_buffer(&out_buffer, camera_size, &mut back_buffer, TARGET_SIZE);
         let mut front_buffer = front_buffer.write().unwrap();
         std::mem::swap(&mut back_buffer, &mut front_buffer);
+        drop(front_buffer);
 
         std::thread::sleep(SLEEP_TIME);
     }
@@ -144,12 +169,14 @@ async fn handle_connection(socket: WebSocket, addr: SocketAddr, peer_map: PeerMa
     println!("{addr} connected to the websocket");
 
     let (mut sender, mut receiver) = socket.split();
-    let (tx, rx) = std::sync::mpsc::channel::<Bytes>();
-    peer_map.lock().unwrap().insert(addr, tx);
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<Bytes>(32);
+    let (waiting_tx, mut waiting_rx) = tokio::sync::mpsc::channel::<()>(32);
+    peer_map.lock().await.insert(addr, tx);
 
     let mut recv_task = tokio::task::spawn(async move {
         while let Some(Ok(msg)) = receiver.next().await {
             match msg {
+                Message::Text(_) => waiting_tx.send(()).await.unwrap(),
                 Message::Close(_) => break,
                 _ => {}
             }
@@ -157,7 +184,11 @@ async fn handle_connection(socket: WebSocket, addr: SocketAddr, peer_map: PeerMa
     });
 
     let mut send_task = tokio::task::spawn(async move {
-        while let Ok(bytes) = rx.recv() {
+        while let Some(bytes) = rx.recv().await {
+            if waiting_rx.try_recv().is_err() {
+                continue;
+            }
+
             if sender.send(Message::Binary(bytes)).await.is_err() {
                 break;
             }
@@ -167,9 +198,9 @@ async fn handle_connection(socket: WebSocket, addr: SocketAddr, peer_map: PeerMa
     tokio::select! {
         _ = &mut send_task => recv_task.abort(),
         _ = &mut recv_task => send_task.abort(),
-    };
+    }
 
-    peer_map.lock().unwrap().remove(&addr);
+    peer_map.lock().await.remove(&addr);
     println!("{addr} disconnected from the websocket");
 }
 
@@ -183,11 +214,10 @@ async fn update_native_window(event_loop: EventLoopProxy<UserEvent>) {
 async fn update_peers(peer_map: PeerMap, front_buffer: &RwLock<Vec<u8>>) {
     loop {
         {
-            let peer_map = peer_map.lock().unwrap();
             let bytes = Bytes::copy_from_slice(&front_buffer.read().unwrap());
 
-            for tx in peer_map.values() {
-                if tx.send(bytes.clone()).is_err() {
+            for tx in peer_map.lock().await.values() {
+                if tx.send(bytes.clone()).await.is_err() {
                     println!("Weird tx");
                 }
             }
@@ -200,10 +230,8 @@ async fn update_peers(peer_map: PeerMap, front_buffer: &RwLock<Vec<u8>>) {
 #[tokio::main]
 async fn main() {
     print_available_cameras();
-    let camera = make_camera();
-    let size = get_camera_resolution(&camera);
-    let front_buffer = RwLock::new(make_buffer(size));
-    let mut app = App::new(size, &front_buffer);
+    let front_buffer = RwLock::new(make_buffer(TARGET_SIZE));
+    let mut app = App::new(TARGET_SIZE, &front_buffer);
     let event_loop = EventLoop::with_user_event().build().unwrap();
     let peer_map = PeerMap::new(Mutex::new(HashMap::new()));
 
