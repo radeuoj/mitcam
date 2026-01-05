@@ -4,8 +4,8 @@
   <meta charset="UTF-8">
   <title>Mitcam</title>
 </head>
-<body>
-  <canvas id="canvas" style="width: 100%"></canvas>
+<body style="display: flex; margin: 0; width: 100vw; height: 100vh; justify-content: center; align-items: center">
+  <canvas id="canvas" style="width: min(100%, 100vh * 16 / 9); height: min(100%, 100vw * 9 / 16); aspect-ratio: 16 / 9"></canvas>
   <script src="script.js"></script>
 </body>
 </html>
