@@ -17,7 +17,6 @@ use std::sync::RwLock;
 use std::time::Duration;
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;
-use tower_http::services::ServeDir;
 use tower_http::trace::{DefaultMakeSpan, TraceLayer};
 use winit::application::ApplicationHandler;
 use winit::event::WindowEvent;
@@ -157,7 +156,8 @@ async fn run_web_server(peer_map: PeerMap) {
         .route("/ws", any(async move |ws: WebSocketUpgrade, _user_agent: Option<TypedHeader<headers::UserAgent>>, ConnectInfo(addr): ConnectInfo<SocketAddr>| {
             ws.on_upgrade(move |socket| handle_connection(socket, addr, peer_map))
         }))
-        .fallback_service(ServeDir::new("web"))
+        .route("/", axum::routing::get(axum::response::Html(include_bytes!("index.html"))))
+        .route("/script.js", axum::routing::get(include_bytes!("script.js")))
         .layer(TraceLayer::new_for_http().make_span_with(DefaultMakeSpan::default().include_headers(true)));
 
     let listener = TcpListener::bind("0.0.0.0:5555").await.unwrap();
